@@ -1,58 +1,126 @@
 package com.elyes.couchlurker
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
-import android.view.Menu
-import android.view.MenuItem
-import androidx.appcompat.app.AppCompatActivity
-import androidx.navigation.findNavController
-import androidx.navigation.ui.AppBarConfiguration
-import androidx.navigation.ui.navigateUp
-import androidx.navigation.ui.setupActionBarWithNavController
+import android.util.Log
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.CameraSelector.LENS_FACING_FRONT
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.LifecycleOwner
 import com.elyes.couchlurker.databinding.ActivityMainBinding
-import com.google.android.material.snackbar.Snackbar
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceDetection
+import io.reactivex.Observable
+import io.reactivex.android.schedulers.AndroidSchedulers
+import java.util.concurrent.TimeUnit
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : FragmentActivity() {
 
-    private lateinit var appBarConfiguration: AppBarConfiguration
     private lateinit var binding: ActivityMainBinding
+
+    private val faceDetector = FaceDetection.getClient()
+    private val imageAnalyzer = ImageAnalysis.Analyzer { imageProxy ->
+        val mediaImage = imageProxy.image
+        if (mediaImage != null) {
+            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+            faceDetector.process(image)
+                .addOnSuccessListener {
+                    Log.d(this.localClassName, "number of faces: ${it.size}")
+                    // TODO success handler
+                }
+                .addOnFailureListener {
+                    // TODO failure handler
+                }
+        }
+        imageProxy.close()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+    }
 
-        setSupportActionBar(binding.toolbar)
+    override fun onStart() {
+        super.onStart()
+        handlePermissions()
+    }
 
-        val navController = findNavController(R.id.nav_host_fragment_content_main)
-        appBarConfiguration = AppBarConfiguration(navController.graph)
-        setupActionBarWithNavController(navController, appBarConfiguration)
+    private fun handlePermissions() {
+        val isPermissionGranted = ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
 
-        binding.fab.setOnClickListener { view ->
-            Snackbar.make(view, "Replace with your own action", Snackbar.LENGTH_LONG)
-                .setAction("Action", null).show()
+        if (isPermissionGranted) {
+            prepareCameraCapture()
+        } else {
+            val requestPermissionLauncher =
+                registerForActivityResult(
+                    ActivityResultContracts.RequestPermission()
+                ) { isGranted: Boolean ->
+                    if (isGranted) {
+                        prepareCameraCapture()
+                    } else {
+                        finish()
+                    }
+                }
+            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
         }
     }
 
-    override fun onCreateOptionsMenu(menu: Menu): Boolean {
-        // Inflate the menu; this adds items to the action bar if it is present.
-        menuInflater.inflate(R.menu.menu_main, menu)
-        return true
+    private fun prepareCameraCapture() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener(
+            {
+                val cameraProvider = cameraProviderFuture.get()
+                val imageCapture = ImageCapture.Builder().build()
+                val cameraSelector = CameraSelector.Builder()
+                    .requireLensFacing(LENS_FACING_FRONT)
+                    .build()
+
+                cameraProvider.bindToLifecycle(
+                    this as LifecycleOwner,
+                    cameraSelector,
+                    imageCapture
+                )
+                observeDetectionRequests(imageCapture)
+            },
+            ContextCompat.getMainExecutor(this)
+        )
     }
 
-    override fun onOptionsItemSelected(item: MenuItem): Boolean {
-        // Handle action bar item clicks here. The action bar will
-        // automatically handle clicks on the Home/Up button, so long
-        // as you specify a parent activity in AndroidManifest.xml.
-        return when (item.itemId) {
-            R.id.action_settings -> true
-            else -> super.onOptionsItemSelected(item)
-        }
+    private fun observeDetectionRequests(imageCapture: ImageCapture) {
+        Observable.interval(5, TimeUnit.SECONDS)
+            .observeOn(AndroidSchedulers.mainThread())
+            .subscribe {
+                takePicture(imageCapture)
+            }
     }
 
-    override fun onSupportNavigateUp(): Boolean {
-        val navController = findNavController(R.id.nav_host_fragment_content_main)
-        return navController.navigateUp(appBarConfiguration)
-                || super.onSupportNavigateUp()
+    private fun takePicture(imageCapture: ImageCapture) {
+        imageCapture.takePicture(
+            ContextCompat.getMainExecutor(this),
+            object: ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    imageAnalyzer.analyze(image)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    // TODO capture error handler
+                }
+            }
+        )
     }
+
 }
