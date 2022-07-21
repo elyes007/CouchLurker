@@ -15,12 +15,15 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
 import com.elyes.couchlurker.databinding.ActivityMainBinding
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
-import io.reactivex.Observable
-import io.reactivex.android.schedulers.AndroidSchedulers
-import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asExecutor
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : FragmentActivity() {
 
@@ -48,43 +51,54 @@ class MainActivity : FragmentActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+
+        lifecycleScope.launch(Dispatchers.Default) {
+            val isPermissionGranted = askForCameraPermission()
+
+            if (isPermissionGranted.not()) {
+                withContext(Dispatchers.Main) { finish() }
+                return@launch
+            }
+
+            val imageCapture = prepareImageCapture()
+
+            observeDetectionRequests(imageCapture)
+        }
     }
 
-    override fun onStart() {
-        super.onStart()
-        handlePermissions()
-    }
-
-    private fun handlePermissions() {
-        val isPermissionGranted = ContextCompat.checkSelfPermission(
+    private fun askForCameraPermission(): Boolean {
+        if (
+            ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
-
-        if (isPermissionGranted) {
-            prepareCameraCapture()
+        ) {
+            return true
         } else {
+            var isPermissionGranted: Boolean? = null
             val requestPermissionLauncher =
                 registerForActivityResult(
                     ActivityResultContracts.RequestPermission()
                 ) { isGranted: Boolean ->
-                    if (isGranted) {
-                        prepareCameraCapture()
-                    } else {
-                        finish()
-                    }
+                    isPermissionGranted = isGranted
                 }
             requestPermissionLauncher.launch(Manifest.permission.CAMERA)
+
+            while (isPermissionGranted == null) {
+                // wait for the user to decide
+            }
+            return isPermissionGranted!!
         }
     }
 
-    private fun prepareCameraCapture() {
+    private fun prepareImageCapture(): ImageCapture {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        var imageCapture: ImageCapture? = null
 
         cameraProviderFuture.addListener(
             {
                 val cameraProvider = cameraProviderFuture.get()
-                val imageCapture = ImageCapture.Builder().build()
+                val imgCapture = ImageCapture.Builder().build()
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(LENS_FACING_FRONT)
                     .build()
@@ -92,25 +106,30 @@ class MainActivity : FragmentActivity() {
                 cameraProvider.bindToLifecycle(
                     this as LifecycleOwner,
                     cameraSelector,
-                    imageCapture
+                    imgCapture
                 )
-                observeDetectionRequests(imageCapture)
+
+                imageCapture = imgCapture
             },
-            ContextCompat.getMainExecutor(this)
+            mainExecutor
         )
+
+        while (imageCapture == null) {
+            // wait for camera to be prepared
+        }
+        return imageCapture!!
     }
 
-    private fun observeDetectionRequests(imageCapture: ImageCapture) {
-        Observable.interval(5, TimeUnit.SECONDS)
-            .observeOn(AndroidSchedulers.mainThread())
-            .subscribe {
-                takePicture(imageCapture)
-            }
+    private suspend fun observeDetectionRequests(imageCapture: ImageCapture) {
+        while (true) {
+            delay(5000L)
+            takePicture(imageCapture)
+        }
     }
 
     private fun takePicture(imageCapture: ImageCapture) {
         imageCapture.takePicture(
-            ContextCompat.getMainExecutor(this),
+            Dispatchers.Default.asExecutor(),
             object: ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
                     imageAnalyzer.analyze(image)
