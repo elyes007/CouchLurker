@@ -7,7 +7,6 @@ import android.util.Log
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.CameraSelector.LENS_FACING_FRONT
-import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
@@ -19,32 +18,21 @@ import androidx.lifecycle.lifecycleScope
 import com.elyes.couchlurker.databinding.ActivityMainBinding
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.suspendCoroutine
 
 class MainActivity : FragmentActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
     private val faceDetector = FaceDetection.getClient()
-    private val imageAnalyzer = ImageAnalysis.Analyzer { imageProxy ->
-        val mediaImage = imageProxy.image
-        if (mediaImage != null) {
-            val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-            faceDetector.process(image)
-                .addOnSuccessListener {
-                    Log.d(this.localClassName, "number of faces: ${it.size}")
-                    // TODO success handler
-                }
-                .addOnFailureListener {
-                    // TODO failure handler
-                }
-        }
-        imageProxy.close()
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -52,7 +40,12 @@ class MainActivity : FragmentActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        lifecycleScope.launch(Dispatchers.Default) {
+        /**
+         * We need to use CoroutineStart.UNDISPATCHED because askForCameraPermission needs to be
+         * executed in onCreate, or more accurately before onStart, otherwise registerForActivityResult
+         * will throw an error.
+         */
+        lifecycleScope.launch(context = Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             val isPermissionGranted = askForCameraPermission()
 
             if (isPermissionGranted.not()) {
@@ -66,39 +59,34 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun askForCameraPermission(): Boolean {
+    private suspend fun askForCameraPermission(): Boolean = suspendCoroutine { continuation ->
         if (
             ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
         ) {
-            return true
+            continuation.resume(true)
         } else {
-            var isPermissionGranted: Boolean? = null
-            val requestPermissionLauncher =
-                registerForActivityResult(
-                    ActivityResultContracts.RequestPermission()
-                ) { isGranted: Boolean ->
-                    isPermissionGranted = isGranted
-                }
-            requestPermissionLauncher.launch(Manifest.permission.CAMERA)
-
-            while (isPermissionGranted == null) {
-                // wait for the user to decide
+            lifecycleScope.launch {
+                val requestPermissionLauncher =
+                    registerForActivityResult(
+                        ActivityResultContracts.RequestPermission()
+                    ) { isGranted: Boolean ->
+                        continuation.resume(isGranted)
+                    }
+                requestPermissionLauncher.launch(Manifest.permission.CAMERA)
             }
-            return isPermissionGranted!!
         }
     }
 
-    private fun prepareImageCapture(): ImageCapture {
+    private suspend fun prepareImageCapture(): ImageCapture = suspendCoroutine { continuation ->
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        var imageCapture: ImageCapture? = null
 
         cameraProviderFuture.addListener(
             {
                 val cameraProvider = cameraProviderFuture.get()
-                val imgCapture = ImageCapture.Builder().build()
+                val imageCapture = ImageCapture.Builder().build()
                 val cameraSelector = CameraSelector.Builder()
                     .requireLensFacing(LENS_FACING_FRONT)
                     .build()
@@ -106,40 +94,59 @@ class MainActivity : FragmentActivity() {
                 cameraProvider.bindToLifecycle(
                     this as LifecycleOwner,
                     cameraSelector,
-                    imgCapture
+                    imageCapture
                 )
 
-                imageCapture = imgCapture
+                continuation.resume(imageCapture)
             },
             mainExecutor
         )
-
-        while (imageCapture == null) {
-            // wait for camera to be prepared
-        }
-        return imageCapture!!
     }
 
     private suspend fun observeDetectionRequests(imageCapture: ImageCapture) {
         while (true) {
             delay(5000L)
-            takePicture(imageCapture)
+            try {
+                val image = takePicture(imageCapture)
+                val faceCount = analyzeImage(image)
+                Log.d(this.localClassName, "number of faces: $faceCount")
+            } catch (error: Throwable) {
+
+            }
         }
     }
 
-    private fun takePicture(imageCapture: ImageCapture) {
+    private suspend fun takePicture(imageCapture: ImageCapture): ImageProxy = suspendCoroutine { continuation ->
         imageCapture.takePicture(
             Dispatchers.Default.asExecutor(),
             object: ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
-                    imageAnalyzer.analyze(image)
+                    continuation.resume(image)
                 }
-
                 override fun onError(exception: ImageCaptureException) {
-                    // TODO capture error handler
+                    continuation.resumeWithException(exception)
                 }
             }
         )
+    }
+
+    private suspend fun analyzeImage(imageProxy: ImageProxy): Int = suspendCoroutine { continuation ->
+        val mediaImage = imageProxy.image
+        if (mediaImage == null) {
+            continuation.resumeWithException(Throwable("ImageProxy.image is null"))
+            return@suspendCoroutine
+        }
+
+        val inputImage = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+        faceDetector.process(inputImage)
+            .addOnSuccessListener {
+                continuation.resume(it.size)
+            }
+            .addOnFailureListener {
+                continuation.resumeWithException(it)
+            }
+
+        imageProxy.close()
     }
 
 }
